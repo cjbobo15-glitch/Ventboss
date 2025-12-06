@@ -1,8 +1,6 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-import plotly.express as px
-from openai import OpenAI
 
 st.set_page_config(page_title="VentBoss AI", layout="centered", initial_sidebar_state="collapsed")
 
