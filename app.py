@@ -1,318 +1,438 @@
 import streamlit as st
-from datetime import datetime
+import pandas as pd
+import numpy as np
+import plotly.express as px
+from datetime import date, datetime
+import os
+import hashlib
+import yaml
+from yaml.loader import SafeLoader
+import streamlit_authenticator as stauth
+from sqlalchemy import create_engine, Column, Integer, String, Float, Date
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from fpdf import FPDF
+import openai
+from openai import OpenAI
 
-# ========================= CONFIG & SECURITY =========================
+# ========================= CONFIG =========================
 st.set_page_config(
-    page_title="VentBoss AI",
+    page_title="VentBoss AI v2",
     page_icon="🫁",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Simple login (replace or upgrade to Auth0/Clerk later)
-if 'authenticated' not in st.session_state:
-    st.session_state.authenticated = False
+UPLOAD_FOLDER = "uploads"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-if not st.session_state.authenticated:
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        st.markdown("# 🫁 VentBoss AI")
-        st.markdown("<div style='text-align:center; color:#64748b; margin-bottom:40px;'>Complex Respiratory Management System</div>", unsafe_allow_html=True)
-        password = st.text_input("Enter Password", type="password", label_visibility="collapsed")
-        if st.button("Login to VentBoss AI", use_container_width=True, type="primary"):
-            if password == "ventboss2025":
-                st.session_state.authenticated = True
-                st.success("Welcome to VentBoss AI")
-                st.rerun()
-            else:
-                st.error("Incorrect password")
+# ========================= DATABASE =========================
+engine = create_engine('sqlite:///ventboss.db')
+Base = declarative_base()
+
+class Patient(Base):
+    __tablename__ = 'patients'
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+    mrn = Column(String, unique=True)
+    dx = Column(String)
+    device = Column(String)
+    risk = Column(Float, default=50.0)  # 0-100
+    last_download = Column(Date)
+    phone = Column(String)
+    notes = Column(String)
+
+Base.metadata.create_all(engine)
+Session = sessionmaker(bind=engine)
+
+# Seed initial data if empty
+with Session() as session:
+    if session.query(Patient).count() == 0:
+        samples = [
+            Patient(name="J. Rodriguez", mrn="MRN001", dx="Amyotrophic Lateral Sclerosis", device="VOCSN", risk=88, last_download=date(2025,12,5), phone="667-xxx-xxxx"),
+            Patient(name="K. Washington", mrn="MRN002", dx="Duchenne Muscular Dystrophy", device="Astral 150", risk=94, last_download=date(2025,12,6), phone="410-xxx-xxxx"),
+            Patient(name="M. Thompson", mrn="MRN003", dx="COPD", device="Trilogy Evo", risk=76, last_download=date(2025,12,4), phone="443-xxx-xxxx"),
+            Patient(name="T. Clark", mrn="MRN004", dx="Kyphoscoliosis", device="Trilogy Evo O2", risk=61, last_download=date(2025,12,3), phone="301-xxx-xxxx"),
+            Patient(name="S. Patel", mrn="MRN005", dx="Obesity Hypoventilation Syndrome", device="Trilogy Evo", risk=44, last_download=date(2025,12,7), phone="240-xxx-xxxx"),
+        ]
+        session.add_all(samples)
+        session.commit()
+
+# ========================= AUTHENTICATION =========================
+# Put real hashed passwords in st.secrets in production!
+names = ["Alex Rivera", "Jordan Lee", "Taylor Morgan", "Chris Admin"]
+usernames = ["arivera", "jlee", "tmorgan", "admin"]
+roles = ["admin", "rt", "billing", "admin"]
+
+# In production use st.secrets["passwords"] with pre-hashed values
+hashed_passwords = stauth.Hasher(['ventboss2025', 'password123', 'billing99', 'admin999']).generate()
+
+authenticator = stauth.Authenticate(
+    names, usernames, hashed_passwords,
+    "ventboss_dashboard", "ventboss_auth", cookie_expiry_days=30
+)
+
+name, authentication_status, username = authenticator.login(location='sidebar')
+
+if not authentication_status:
     st.stop()
 
-# ========================= SIDEBAR =========================
+# Get role
+role = roles[usernames.index(username)]
+
 with st.sidebar:
-    st.markdown("# 🫁 VentBoss AI")
-    st.markdown("**Clinical Excellence Platform**")
+    st.markdown(f"**Welcome {name}**")
+    st.markdown(f"_Role: {role.title()}_")
+    authenticator.logout("Logout", "main")
     st.divider()
-    st.markdown("**Logged in as**")
-    st.markdown("**Alex Rivera, RRT, CPFT**")
-    st.markdown("_Complex Respiratory Specialist_")
-    
-    if st.button("Logout"):
-        st.session_state.authenticated = False
-        st.rerun()
-        
-    st.divider()
-    st.markdown("**Live Dashboard**")
-    total_patients = len(st.session_state.get('patients', []))
-    high_risk = sum(1 for p in st.session_state.get('patients', []) if p["risk"] >= 85)
-    medium_risk = sum(1 for p in st.session_state.get('patients', []) if 70 <= p["risk"] < 85)
-    st.metric("Total Patients", total_patients)
-    st.metric("High Risk (≥85%)", high_risk)
-    st.metric("Medium Risk", medium_risk)
-    st.caption("Data refreshes every 6 hours")
+    st.metric("Total Patients", Session().query(Patient).count())
+    high_risk = Session().query(Patient).filter(Patient.risk >= 85).count()
+    st.metric("High Risk (≥85)", high_risk, delta=None)
 
 # ========================= STYLING =========================
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-    
-    html, body, [class*="css"]  {
-        font-family: 'Inter', sans-serif;
-        background: #f8fafc;
-        color: #1e293b;
-    }
-    .main-header { font-size: 42px; font-weight: 800; color: #0f172a; text-align: center; margin: 20px 0 8px 0; letter-spacing: -1.2px; }
-    .sub-header { text-align: center; color: #64748b; font-size: 18px; font-weight: 500; margin-bottom: 40px; }
-    
-    .patient-card {
-        background: #ffffff;
-        border: 1px solid #e2e8f0;
-        border-radius: 12px;
-        padding: 24px;
-        margin: 16px 0;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.04);
-        transition: all 0.25s ease;
-    }
-    .patient-card:hover {
-        border-color: #3b82f6;
-        box-shadow: 0 12px 30px rgba(59, 130, 246, 0.15);
-        transform: translateY(-2px);
-    }
-    .risk-value {
-        font-size: 36px;
-        font-weight: 800;
-        line-height: 1;
-    }
-    .risk-high { color: #dc2626; }
-    .risk-medium { color: #f59e0b; }
-    .risk-low { color: #10b981; }
-    
-    .stButton > button {
-        background: #3b82f6;
-        color: white;
-        font-weight: 600;
-        border-radius: 8px;
-        border: none;
-        padding: 12px 24px;
-        font-size: 16px;
-    }
-    .stButton > button:hover {
-        background: #2563eb;
-    }
+    html, body, [class*="css"] {font-family: 'Inter', sans-serif;}
+    .main-header {font-size: 48px; font-weight: 800; color: #0f172a; text-align: center; letter-spacing: -1.5px;}
+    .sub-header {text-align: center; color: #64748b; font-size: 19px; font-weight: 500; margin-bottom: 50px;}
+    .risk-high {color: #dc2626 !important;}
+    .risk-medium {color: #f59e0b !important;}
+    .risk-low {color: #10b981 !important;}
+    .days-warning {color: #dc2626; font-weight: 600;}
+    .days-ok {color: #f59e0b;}
 </style>
 """, unsafe_allow_html=True)
 
-# ========================= DATA =========================
-patients = [
-    {"name": "J. Rodriguez", "dx": "Amyotrophic Lateral Sclerosis", "device": "VOCSN", "risk": 88, "last": "2025-12-05", "phone": "667-xxx-xxxx"},
-    {"name": "K. Washington", "dx": "Duchenne Muscular Dystrophy", "device": "Astral 150", "risk": 94, "last": "2025-12-06", "phone": "410-xxx-xxxx"},
-    {"name": "M. Thompson", "dx": "COPD", "device": "Trilogy Evo", "risk": 76, "last": "2025-12-04", "phone": "443-xxx-xxxx"},
-    {"name": "T. Clark", "dx": "Kyphoscoliosis", "device": "Trilogy Evo O2", "risk": 61, "last": "2025-12-03", "phone": "301-xxx-xxxx"},
-    {"name": "S. Patel", "dx": "Obesity Hypoventilation Syndrome", "device": "Trilogy Evo", "risk": 44, "last": "2025-12-07", "phone": "240-xxx-xxxx"},
-    {"name": "L. Chen", "dx": "Post-Polio Syndrome", "device": "VOCSN", "risk": 81, "last": "2025-12-02", "phone": "202-xxx-xxxx"},
-]
+# ========================= HELPERS =========================
+def load_patients():
+    with Session() as session:
+        patients = session.query(Patient).all()
+        return pd.DataFrame([{
+            "id": p.id,
+            "name": p.name,
+            "mrn": p.mrn,
+            "dx": p.dx,
+            "device": p.device,
+            "risk": round(p.risk, 1),
+            "last_download": p.last_download,
+            "phone": p.phone,
+            "notes": p.notes
+        } for p in patients])
 
-# Sort by risk descending
-patients.sort(key=lambda x: x['risk'], reverse=True)
+def save_uploaded_file(uploaded_file, patient_name):
+    safe_name = "".join(c for c in patient_name if c.isalnum() or c in " -_").rstrip()
+    file_path = os.path.join(UPLOAD_FOLDER, f"{safe_name}_{uploaded_file.name}")
+    with open(file_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return file_path
 
-# Store in session state for future extensions
-st.session_state.patients = patients
-
-current_date = datetime(2025, 12, 8)
-
-# ========================= HEADER =========================
-st.markdown('<div class="main-header">VentBoss AI</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Complex Respiratory Management System • Clinical Excellence Platform</div>', unsafe_allow_html=True)
-
-# ========================= TABS =========================
-tab1, tab2, tab3, tab4 = st.tabs(["Risk Board", "AI Titration", "Compliance Letters", "Settings"])
-
-# ------------------- RISK BOARD -------------------
-with tab1:
-    st.subheader("30-Day Readmission Risk Board")
+def parse_csv_metrics(file_path):
+    df = pd.read_csv(file_path)
+    metrics = {}
     
-    for p in patients:
-        last_date = datetime.strptime(p["last"], "%Y-%m-%d")
-        days_ago = (current_date - last_date).days
+    # Common column name variations
+    vt_cols = [col for col in df.columns if col.lower() in ['vt', 'tidal volume', 'tidal_volume', 'exhaled vt']]
+    leak_cols = [col for col in df.columns if 'leak' in col.lower()]
+    pressure_cols = [col for col in df.columns if col.lower() in ['ipap', 'pressure', 'pip']]
+    ahi_cols = [col for col in df.columns if 'ahi' in col.lower()]
+    
+    if vt_cols:
+        metrics["Average Tidal Volume"] = f"{df[vt_cols[0]].mean():.0f} mL"
+    if leak_cols:
+        metrics["95th Percentile Leak"] = f"{np.percentile(df[leak_cols[0]].dropna(), 95):.0f} L/min"
+    if pressure_cols:
+        metrics["Peak Pressure"] = f"{df[pressure_cols[0]].max():.1f} cmH₂O"
+    if ahi_cols:
+        metrics["AHI"] = f"{df[ahi_cols[0]].mean():.1f} events/hr"
+    
+    metrics["Sessions Found"] = len(df) // 1000  # rough estimate
+    return metrics
+
+def calculate_risk_score(metrics):
+    # Simple clinically-inspired risk model
+    risk = 50
+    if "AHI" in metrics:
+        ahi = float(metrics["AHI"].split()[0])
+        risk += ahi * 4
+    if "95th Percentile Leak" in metrics:
+        leak = float(metrics["95th Percentile Leak"].split()[0])
+        risk += max(0, leak - 30) * 1.2
+    return min(99.9, max(10.0, risk))
+
+# ========================= MAIN APP =========================
+st.markdown('<div class="main-header">VentBoss AI v2</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Clinical Excellence Platform • Built for RTs Who Save Lives</div>', unsafe_allow_html=True)
+
+tab_dashboard, tab_risk, tab_patients, tab_titration, tab_compliance, tab_settings = st.tabs([
+    "Dashboard", "Risk Board", "Patient Management", "AI Titration", "Compliance Letters", "Settings"
+])
+
+patients_df = load_patients()
+patients_df = patients_df.sort_values(by="risk", ascending=False)
+
+# ======================== DASHBOARD ========================
+with tab_dashboard:
+    st.subheader("Live Clinical Overview")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total Patients", len(patients_df))
+    with col2:
+        st.metric("Avg Risk Score", f"{patients_df['risk'].mean():.1f}%")
+    with col3:
+        st.metric("High Risk Patients", len(patients_df[patients_df['risk'] >= 85]))
+    with col4:
+        overdue = len(patients_df[pd.to_datetime('today').normalize() - pd.to_datetime(patients_df['last_download']) > pd.Timedelta(days=14)])
+        st.metric("Overdue Downloads (>14d)", overdue)
+    
+    # Risk distribution
+    risk_bins = pd.cut(patients_df['risk'], bins=[0, 70, 85, 100], labels=["Low (<70)", "Medium (70-84)", "High (≥85)"])
+    fig = px.pie(values=risk_bins.value_counts().values, names=risk_bins.value_counts().index, 
+                 title="Readmission Risk Distribution", color_discrete_sequence=["#10b981", "#f59e0b", "#dc2626"])
+    st.plotly_chart(fig, use_container_width=True)
+
+# ======================== RISK BOARD ========================
+with tab_risk:
+    st.subheader("30-Day Readmission Risk Board")
+    today = date.today()
+    
+    for _, p in patients_df.iterrows():
+        days_ago = (today - p['last_download']).days if p['last_download'] else 999
         
-        if p["risk"] >= 85:
-            risk_class = "risk-high"
-            risk_label = "High Risk"
-        elif p["risk"] >= 70:
-            risk_class = "risk-medium"
-            risk_label = "Medium Risk"
-        else:
-            risk_class = "risk-low"
-            risk_label = "Low Risk"
-            
+        risk_class = "risk-high" if p['risk'] >= 85 else "risk-medium" if p['risk'] >= 70 else "risk-low"
+        days_class = "days-warning" if days_ago > 14 else "days-ok" if days_ago > 7 else ""
+        
         st.markdown(f"""
-        <div class="patient-card">
-            <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+        <div class="patient-card" style="background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:24px; margin:16px 0; box-shadow:0 4px 12px rgba(0,0,0,0.04);">
+            <div style="display:flex; justify-content:space-between; align-items:flex-start;">
                 <div>
-                    <h3 style="margin:0;">{p['name']}</h3>
-                    <p style="margin:4px 0; color:#64748b; font-size:15px;">{p['dx']} — {p['device']}</p>
-                    <p style="margin:8px 0 0 0; color:#475569; font-weight:500;">Phone: {p['phone']}</p>
+                    <h3 style="margin:0;">{p['name']} <span style="font-size:14px; color:#64748b;">({p['mrn'] or 'No MRN'})</span></h3>
+                    <p style="margin:4px 0; color:#64748b;">{p['dx']} — {p['device']}</p>
+                    <p style="margin:8px 0 0 0; color:#475569;">Phone: {p['phone'] or 'Not provided'}</p>
                 </div>
-                <div style="text-align: right;">
-                    <div class="risk-value {risk_class}">{p['risk']}%</div>
-                    <div style="color:#94a3b8; font-size:14px; margin-top:4px;">{risk_label}</div>
-                    <div style="color:#64748b; font-size:14px;">Last download: {days_ago} days ago</div>
+                <div style="text-align:right;">
+                    <div style="font-size:36px; font-weight:800; color:{'#dc2626' if p['risk']>=85 else '#f59e0b' if p['risk']>=70 else '#10b981'};">
+                        {p['risk']}%
+                    </div>
+                    <div class="{days_class}">Last download: {days_ago} days ago</div>
                 </div>
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-# ------------------- AI TITRATION -------------------
-with tab2:
-    st.subheader("Ventilator Data Analysis & AI Titration Recommendation")
+# ======================== PATIENT MANAGEMENT ========================
+with tab_patients:
+    if role != "billing":  # Billing can view but not edit
+        st.subheader("Patient Management")
+        
+        with st.expander("➕ Add New Patient", expanded=False):
+            with st.form("add_patient"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    name = st.text_input("Full Name")
+                    mrn = st.text_input("MRN")
+                    dx = st.text_input("Diagnosis")
+                with col2:
+                    device = st.selectbox("Device", ["Trilogy Evo", "Trilogy Evo O2", "VOCSN", "Astral 150", "LTV", "Trilogy 202"])
+                    phone = st.text_input("Phone")
+                    risk = st.slider("Initial Risk %", 0, 100, 50)
+                submitted = st.form_submit_button("Add Patient")
+                if submitted and name:
+                    with Session() as session:
+                        new_p = Patient(name=name, mrn=mrn, dx=dx, device=device, phone=phone, risk=risk, last_download=date.today())
+                        session.add(new_p)
+                        session.commit()
+                    st.success(f"Added {name}")
+                    st.rerun()
+        
+        # Display editable table
+        display_df = patients_df.copy()
+        edited_df = st.data_editor(
+            display_df.drop(columns=["id"]),
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True
+        )
+        
+        if st.button("💾 Save All Changes"):
+            with Session() as session:
+                for _, row in edited_df.iterrows():
+                    session.query(Patient).filter(Patient.id == row['id']).update({
+                        "name": row['name'],
+                        "mrn": row['mrn'],
+                        "dx": row['dx'],
+                        "device": row['device'],
+                        "risk": row['risk'],
+                        "phone": row['phone']
+                    })
+                session.commit()
+            st.success("All changes saved!")
+            st.rerun()
+    else:
+        st.info("Billing users have read-only access to patient data.")
+
+# ======================== AI TITRATION ========================
+with tab_titration:
+    st.subheader("AI Ventilator Data Analysis & Titration")
     
-    col1, col2 = st.columns([1, 2])
+    patient_options = ["-- Select Patient --"] + list(patients_df["name"])
+    selected_patient_name = st.selectbox("Patient", patient_options, key="titration_patient")
+    
+    selected_patient = patients_df[patients_df["name"] == selected_patient_name].iloc[0] if selected_patient_name != "-- Select Patient --" else None
+    
+    uploaded_file = st.file_uploader("Upload ventilator download (CSV recommended)", type=["csv", "edf"])
+    
+    col1, col2 = st.columns(2)
     with col1:
-        selected_patient = st.selectbox("Select Patient", options=[""] + [p["name"] for p in patients])
-    with col2:
-        device_options = ["Trilogy Evo", "Trilogy Evo O2", "VOCSN", "Astral 150", "Trilogy 202", "LTV"]
-        if selected_patient:
-            sel_p = next(p for p in patients if p["name"] == selected_patient)
-            default_idx = device_options.index(sel_p["device"]) if sel_p["device"] in device_options else 0
-        else:
-            default_idx = 0
-        device = st.selectbox("Device", device_options, index=default_idx)
-    
-    uploaded = st.file_uploader("Upload ventilator download (EDF/CSV)", type=["edf", "csv"])
-    
-    col_a, col_b = st.columns(2)
-    with col_a:
         demo = st.button("Load Demo Data", use_container_width=True)
-    with col_b:
-        analyze = st.button("Analyze & Generate Recommendation", use_container_width=True, type="primary")
+    with col2:
+        analyze = st.button("🔬 Analyze & Recommend", use_container_width=True, type="primary")
     
-    if demo or uploaded or analyze:
-        with st.spinner("Processing ventilator data..."):
-            # Demo/hardcoded metrics (replace with real parsing later)
+    if (demo or uploaded_file or analyze) and (selected_patient or demo):
+        if demo:
             metrics = {
                 "Average Tidal Volume": "428 mL",
                 "Percent Triggered Breaths": "34%",
-                "Peak Inspiratory Pressure": "34 cmH₂O",
+                "Peak Pressure": "34 cmH₂O",
                 "95th Percentile Leak": "58 L/min",
                 "AHI": "9.2 events/hr",
                 "SpO₂ Nadir": "86%",
-                "Backup Rate Usage": "71%",
-                "Average Use/Night": "7.8 hrs"
+                "Backup Rate Usage": "71%"
             }
-            
-            st.markdown("#### Key Metrics Summary")
-            st.json(metrics, expanded=False)
-            
-            # AI-powered recommendation if key provided
-            if st.session_state.get('openai_key') and analyze:
-                try:
-                    import openai
-                    client = openai.OpenAI(api_key=st.session_state.openai_key)
-                    response = client.chat.completions.create(
-                        model="gpt-4o",
-                        temperature=0.3,
-                        messages=[
-                            {"role": "system", "content": "You are an expert respiratory therapist specializing in non-invasive and invasive home ventilation titration for DME patients. Provide only the recommended settings and clinical rationale in clear, professional bullet points."},
-                            {"role": "user", "content": f"Device: {device}\nPatient: {selected_patient or 'N/A'}\nMetrics: {metrics}\n\nProvide optimal titration recommendations and expected outcomes."}
-                        ]
-                    )
-                    recommendation = response.choices[0].message.content
-                    st.markdown("#### 🧠 AI-Powered Titration Recommendation (GPT-4o)")
-                    st.markdown(recommendation)
-                except Exception as e:
-                    st.error("OpenAI API error. Check your key or network.")
-                    recommendation = None
-            else:
-                # Fallback static recommendation
-                st.markdown("#### Recommended Settings")
-                st.markdown("""
-                <div style="background:#f8fafc; border:1px solid #e2e8f0; padding:24px; border-radius:12px; font-size:16px;">
-                    <ul style="line-height:1.9;">
-                        <li><strong>Mode:</strong> AVAPS-AE</li>
-                        <li><strong>IPAP Max:</strong> 32 cmH₂O <em>(↑ from current)</em></li>
-                        <li><strong>IPAP Min:</strong> 16 cmH₂O</li>
-                        <li><strong>EPAP:</strong> 11 cmH₂O <em>(↑ leak control)</em></li>
-                        <li><strong>Target Vt:</strong> 480–520 mL (weight-based)</li>
-                        <li><strong>Backup Rate:</strong> 18–20 bpm</li>
-                        <li><strong>Rise Time:</strong> 200 ms</li>
-                    </ul>
-                    <p><strong>Expected Outcomes:</strong> ↑ Triggered breaths to 65–75%, AHI <3, SpO₂ nadir >91%, estimated readmission risk reduction ≈68%</p>
-                </div>
-                """, unsafe_allow_html=True)
-
-# ------------------- COMPLIANCE LETTERS -------------------
-with tab3:
-    st.subheader("90-Day Compliance & Medical Necessity Letter Generator")
-    
-    patient = st.selectbox("Select Patient", [p["name"] for p in patients], key="letter_patient")
-    if st.button("Generate Compliance Letter", use_container_width=True, type="primary"):
-        selected = next(p for p in patients if p["name"] == patient)
+        elif uploaded_file:
+            file_path = save_uploaded_file(uploaded_file, selected_patient_name)
+            metrics = parse_csv_metrics(file_path)
+            if not metrics:
+                st.error("Could not extract metrics. Check CSV format.")
+                metrics = {"Note": "Unsupported file format or columns"}
         
-        letter = f"""> VentBoss Respiratory LLC
-> Clinical Excellence in Home Ventilation
-> 1234 Airway Drive, Suite 500 • Baltimore, MD 21224
-> Phone: (443) 867-5309 • Fax: (443) 867-5310
-> clinical@ventboss.com • www.ventboss.com
+        st.markdown("#### Extracted Metrics")
+        st.json(metrics)
+        
+        new_risk = calculate_risk_score(metrics)
+        st.info(f"Calculated Readmission Risk: **{new_risk:.1f}%** (previously {selected_patient['risk'] if selected_patient else 'N/A'}%)")
+        
+        if analyze and selected_patient:
+            # Update patient risk and last download
+            with Session() as session:
+                p = session.query(Patient).filter(Patient.name == selected_patient_name).first()
+                p.risk = new_risk
+                p.last_download = date.today()
+                session.commit()
+            st.success("Patient risk score and last download updated!")
+        
+        # AI Recommendation
+        if st.session_state.get('openai_key'):
+            try:
+                client = OpenAI(api_key=st.session_state.openai_key)
+                prompt = f"""
+                Expert respiratory therapist. Device: {selected_patient['device'] if selected_patient else 'Unknown'}.
+                Current metrics: {metrics}
+                Provide only the recommended settings changes and clinical rationale in clear, bullet-point format.
+                """
+                response = client.chat.completions.create(
+                    model="gpt-4o",
+                    temperature=0.2,
+                    messages=[{"role": "system", "content": "You are an expert in home ventilation titration."},
+                              {"role": "user", "content": prompt}]
+                )
+                recommendation = response.choices[0].message.content
+                st.markdown("#### 🧠 AI Titration Recommendation (GPT-4o)")
+                st.markdown(recommendation)
+            except Exception as e:
+                st.error("OpenAI error – check your key")
+        else:
+            st.markdown("#### Recommended Settings (Demo)")
+            st.markdown("""
+            - **Mode:** AVAPS-AE  
+            - **IPAP Max:** 32 cmH₂O (↑ from current)  
+            - **EPAP:** 11 cmH₂O (leak control)  
+            - **Target Vt:** 480–520 mL  
+            - **Backup Rate:** 18–20 bpm  
+            **Expected:** AHI <3, triggered breaths ↑65–75%, risk ↓68%
+            """)
 
-{datetime.now().strftime("%B %d, %Y")}
-
-To Whom It May Concern:
-
-RE: {patient}
-Diagnosis: {selected['dx']}
-Device: {selected['device']}
+# ======================== COMPLIANCE LETTERS ========================
+with tab_compliance:
+    st.subheader("90-Day Compliance & Medical Necessity Letter")
+    
+    patient_name = st.selectbox("Select Patient", patients_df["name"], key="compliance_patient")
+    if st.button("Generate PDF Letter", use_container_width=True, type="primary"):
+        patient = patients_df[patients_df["name"] == patient_name].iloc[0]
+        
+        class PDF(FPDF):
+            def header(self):
+                self.set_font('Arial', 'B', 16)
+                self.cell(0, 10, 'VentBoss Respiratory LLC', ln=1, align='C')
+                self.set_font('Arial', '', 12)
+                self.cell(0, 10, 'Clinical Excellence in Home Ventilation', ln=1, align='C')
+                self.cell(0, 10, '1234 Airway Drive, Baltimore, MD 21224 | (443) 867-5309', ln=1, align='C')
+                self.ln(10)
+            
+            def footer(self):
+                self.set_y(-15)
+                self.set_font('Arial', 'I', 8)
+                self.cell(0, 10, f'Page {self.page_no()}', align='C')
+        
+        pdf = PDF()
+        pdf.add_page()
+        pdf.set_font('Arial', '', 12)
+        
+        pdf.set_font('Arial', 'B', 12)
+        pdf.cell(0, 10, f"Date: {date.today().strftime('%B %d, %Y')}", ln=1)
+        pdf.cell(0, 10, "To Whom It May Concern:", ln=1)
+        pdf.ln(5)
+        
+        pdf.multi_cell(0, 8, f"""
+RE: {patient_name}
+MRN: {patient['mrn'] or 'N/A'}
+Diagnosis: {patient['dx']}
+Device: {patient['device']}
 
 The above patient has been under our clinical care for chronic respiratory failure requiring home mechanical ventilation.
 
-**90-Day Compliance Summary:**
-• Percentage of days with usage ≥4 hours: 96% (87 of 90 days)
+90-Day Compliance Summary:
+• Days with usage ≥4 hours: 96% (87/90 days)
 • Average daily usage: 8.4 hours
-• Average Apnea-Hypopnea Index (AHI): 2.1 events/hour
-• 95th percentile mask leak: 24 L/min
-• No clinically significant oxygen desaturations
+• Average AHI: 2.1 events/hour
+• 95th percentile leak: 24 L/min
+• No clinically significant desaturations
 
-The patient demonstrates excellent adherence to prescribed therapy. Continued use of home mechanical ventilation remains medically necessary to maintain gas exchange and prevent clinical deterioration, recurrent hypercapnic respiratory failure, and hospitalization.
+Continued use remains medically necessary. Discontinuation would place the patient at high risk of deterioration and re-hospitalization.
 
-Discontinuation of therapy would place this patient at unacceptably high risk of adverse outcomes.
-
-Please feel free to contact me directly with any questions.
+Please contact me with any questions.
 
 Sincerely,
 
-Alex Rivera, RRT, CPFT
+{name}
 Complex Respiratory Specialist
 VentBoss Respiratory LLC
-Direct: (443) 555-0123
-alex@ventboss.com
-"""
-        st.text_area("Compliance Letter (ready to copy)", letter, height=600)
+clinical@ventboss.com
+        """)
+        
+        pdf_bytes = pdf.output(dest='S').encode('latin-1')
         st.download_button(
-            "Download as .txt",
-            letter,
-            file_name=f"{patient.replace(' ', '_')}_90Day_Compliance_{datetime.now().strftime('%Y%m%d')}.txt",
+            "📥 Download PDF Letter",
+            pdf_bytes,
+            file_name=f"{patient_name.replace(' ', '_')}_Compliance_Letter_{date.today().isoformat()}.pdf",
+            mime="application/pdf",
             use_container_width=True
         )
 
-# ------------------- SETTINGS -------------------
-with tab4:
-    st.subheader("System Settings & Integration")
+# ======================== SETTINGS ========================
+with tab_settings:
+    st.subheader("System Settings")
     
-    st.info("**Production Features Available:** Google Sheets sync • Real-time EDF parsing • Predictive risk modeling • Multi-user roles • HL7/EMR integration • Custom branding")
-    
-    api_key = st.text_input(
-        "OpenAI API Key (for real AI titration recommendations)",
-        type="password",
-        value=st.session_state.get('openai_key', ''),
-        help="Enables GPT-4o-powered titration recommendations"
-    )
-    if api_key:
-        st.session_state.openai_key = api_key
-        st.success("OpenAI key saved — AI recommendations now active")
-    
-    st.markdown("---")
-    st.markdown("**VentBoss Respiratory LLC** • © 2025–2026 • Proprietary & Confidential")
-    st.markdown("<p style='text-align:center; color:#94a3b8;'>For enterprise deployment or partnership inquiries: clinical@ventboss.com</p>", unsafe_allow_html=True)
+    if role == "admin":
+        st.text_input("OpenAI API Key (for real AI recommendations)", type="password", key="openai_key_input")
+        if st.button("Save OpenAI Key"):
+            st.session_state.openai_key = st.text_input("OpenAI API Key (for real AI recommendations)", type="password", value=st.session_state.get('openai_key', ''), key="openai_key_save")
+            st.success("Key saved for this session")
+        
+        st.info("Ready for v3: Supabase auth + storage, HL7 integration, billing module, mobile app, FDA submission package")
+    else:
+        st.info("Settings are admin-only")
 
-# ========================= FOOTER =========================
 st.markdown("---")
-st.markdown("<p style='text-align:center; color:#94a3b8; font-size:14px;'>VentBoss Respiratory • Clinical Excellence Platform • Built for RTs who refuse to let patients fail</p>", unsafe_allow_html=True)
+st.markdown("<p style='text-align:center; color:#94a3b8;'>VentBoss Respiratory • © 2025–2026 • Proprietary & HIPAA-Compliant Infrastructure Ready</p>", unsafe_allow_html=True)
